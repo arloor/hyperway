@@ -600,16 +600,15 @@ fn build_upstream_req_v1_streaming(
     original_scheme_host_port: &SchemeHostPort, request_host: &str,
 ) -> io::Result<Request<Incoming>> {
     let method = req.method().clone();
-    let version = req.version();
     let headers = req.headers().clone();
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(str::to_string);
 
     let upstream_uri = build_upstream_uri(selected, backend, &path, query.as_deref())?;
-    let upstream_version = normalize_upstream_version(version, &upstream_uri);
+    // WebSocket tunnel uses HTTP/1.1 Upgrade semantics.
     let mut builder = Request::builder()
         .method(method)
-        .version(upstream_version)
+        .version(Version::HTTP_11)
         .uri(upstream_uri);
     let new_headers = builder
         .headers_mut()
@@ -636,8 +635,6 @@ fn build_upstream_req_v1_streaming(
         }
     }
 
-    new_headers.remove(CONNECTION);
-    new_headers.remove(UPGRADE);
     if request_host.is_empty() {
         new_headers.remove(HOST);
     }
@@ -1010,7 +1007,7 @@ fn extract_scheme_host_port(
     }
 }
 
-fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
+fn is_websocket_upgrade<B>(req: &Request<B>) -> bool {
     req.headers()
         .get(UPGRADE)
         .and_then(|v| v.to_str().ok())
@@ -1052,5 +1049,25 @@ mod tests {
         let uri = Uri::from_static("https://svc.default.svc.cluster.local:443/");
         assert_eq!(normalize_upstream_version(Version::HTTP_2, &uri), Version::HTTP_2);
         assert_eq!(normalize_upstream_version(Version::HTTP_11, &uri), Version::HTTP_11);
+    }
+
+    #[test]
+    fn websocket_upgrade_header_is_detected_case_insensitively() {
+        let req_result = Request::builder().header(UPGRADE, "WebSocket").body(());
+        let req = match req_result {
+            Ok(req) => req,
+            Err(err) => panic!("build request failed: {err}"),
+        };
+        assert!(is_websocket_upgrade(&req));
+    }
+
+    #[test]
+    fn websocket_upgrade_header_absent_is_not_websocket() {
+        let req_result = Request::builder().body(());
+        let req = match req_result {
+            Ok(req) => req,
+            Err(err) => panic!("build request failed: {err}"),
+        };
+        assert!(!is_websocket_upgrade(&req));
     }
 }
