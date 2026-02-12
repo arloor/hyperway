@@ -1,0 +1,57 @@
+name: Combined Build and Release
+on:
+  push:
+    branches: ["release", "release/*"]
+  pull_request:
+    branches: ["master"]
+permissions:
+  contents: write
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set outputs
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short=8 HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Build hyperway binaries
+        id: build
+        uses: arloor/rust_musl_action@latest
+        with:
+          use_musl: false
+          extra_deps: ""
+          after_install: |
+            apt-get remove -y gcc
+            apt-get install -y gcc-10
+            update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-10 100
+            cc -v
+          args: -p hyperway --features aws_lc_rs,mimalloc --no-default-features
+          apt_mirror: mirrors.mit.edu
+          debug: false
+
+      - name: Copy binaries
+        run: |
+          mkdir -p ${{ github.workspace }}/release_binaries
+          cp ${{ steps.build.outputs.release_dir }}/hyperway ${{ github.workspace }}/release_binaries/hyperway
+          cp ${{ steps.build.outputs.release_dir }}/hyperway_controller ${{ github.workspace }}/release_binaries/hyperway_controller
+          ls -lh ${{ github.workspace }}/release_binaries/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hyperway-binaries
+          path: ${{ github.workspace }}/release_binaries/*
+          retention-days: 1
+
+      - name: Docker build and push
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/release' || startsWith(github.ref, 'refs/heads/release/'))
+        run: |
+          dockerfile="Dockerfile.dyn"
+          podman build -f ${dockerfile} . \
+            -t quay.io/arloor/hyperway:latest \
+          podman login quay.io --username=arloor -p ${{ secrets.QUAY_REGISTRY_PASSWORD }}
+          podman push quay.io/arloor/hyperway:latest
+          podman push quay.io/arloor/hyperway:${{ steps.vars.outputs.sha_short }}

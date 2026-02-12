@@ -1,0 +1,306 @@
+# 完整示例：把原 location.yaml 的 argocd.arloor.com 与 dash.arloor.com 路由迁移到 Gateway API + 独立 controller(CRD 快照)模式
+#
+# 使用方式：
+# 1) 确保集群已安装 Gateway API CRDs（gateway.networking.k8s.io）
+# 2) 替换镜像为你构建的新版本（需包含 hyperway_controller 二进制）
+# 3) kubectl apply -f deploy/gateway-api-argocd-dashboard.yaml
+#
+# 注意：
+# - 原 location.yaml 里的自定义 Host header 在当前 Gateway API 解析实现中暂不支持显式配置。
+# - 本实现会把 upstream 指向 Service FQDN（*.svc.cluster.local），通常可用；若你的上游强依赖特定 Host，需要额外改造。
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: routesnapshots.hyperway.arloor.dev
+spec:
+  group: hyperway.arloor.dev
+  names:
+    kind: RouteSnapshot
+    listKind: RouteSnapshotList
+    plural: routesnapshots
+    singular: routesnapshot
+    shortNames:
+      - rs
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                controllerName:
+                  type: string
+                updatedAt:
+                  type: string
+                checksum:
+                  type: string
+                locations:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                listeners:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+              required:
+                - locations
+            status:
+              type: object
+              properties:
+                observedGeneration:
+                  type: integer
+                  format: int64
+                lastSyncedAt:
+                  type: string
+                lastAppliedChecksum:
+                  type: string
+                locationHostCount:
+                  type: integer
+                  format: int64
+                locationEntryCount:
+                  type: integer
+                  format: int64
+                listenerCount:
+                  type: integer
+                  format: int64
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                      observedGeneration:
+                        type: integer
+                        format: int64
+      subresources:
+        status: {}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hyperway
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hyperway-gateway-api-reader
+rules:
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses", "gateways", "httproutes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses/status", "gateways/status", "httproutes/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["hyperway.arloor.dev"]
+    resources: ["routesnapshots"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: ["hyperway.arloor.dev"]
+    resources: ["routesnapshots/status"]
+    verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hyperway-gateway-api-reader
+subjects:
+  - kind: ServiceAccount
+    name: hyperway
+    namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: hyperway-gateway-api-reader
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyperway
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hyperway
+  template:
+    metadata:
+      labels:
+        app: hyperway
+    spec:
+      serviceAccountName: hyperway
+      containers:
+        - name: proxy
+          image: quay.io/arloor/hyperway:latest
+          imagePullPolicy: Always
+          args:
+            - "--gateway-api-snapshot-name=default-routes"
+            - "--gateway-api-snapshot-namespace=default"
+            - "--gateway-api-snapshot-poll-seconds=3"
+          ports:
+            - name: http
+              containerPort: 80
+            - name: https
+              containerPort: 443
+        - name: gateway-controller
+          image: quay.io/arloor/hyperway:latest
+          imagePullPolicy: Always
+          command: ["/hyperway_controller"]
+          args:
+            - "--gateway-api-snapshot-name=default-routes"
+            - "--gateway-api-snapshot-namespace=default"
+            - "--gateway-api-k8s-poll-seconds=15"
+            - "--gateway-api-k8s-controller-name=hyperway.arloor.dev/gateway-controller"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyperway
+  namespace: default
+spec:
+  type: LoadBalancer
+  ipFamilyPolicy: PreferDualStack
+  ipFamilies:
+    - IPv4
+    - IPv6
+  selector:
+    app: hyperway
+  ports:
+    - name: http
+      port: 7689
+      targetPort: 80
+    - name: https
+      port: 443
+      targetPort: 443
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: hyperway
+spec:
+  controllerName: hyperway.arloor.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: edge
+  namespace: default
+spec:
+  gatewayClassName: hyperway
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: All
+    - name: https
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: arloor-combined-tls
+      allowedRoutes:
+        namespaces:
+          from: All
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: argocd-route
+  namespace: argocd
+spec:
+  parentRefs:
+    - name: edge
+      namespace: default
+      sectionName: http
+    - name: edge
+      namespace: default
+      sectionName: https
+  hostnames:
+    - argocd.arloor.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: argocd-server
+          port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: dashboard-route
+  namespace: kubernetes-dashboard
+spec:
+  parentRefs:
+    - name: edge
+      namespace: default
+      sectionName: http
+    - name: edge
+      namespace: default
+      sectionName: https
+  hostnames:
+    - dash.arloor.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/v1/csrftoken/login
+      backendRefs:
+        - name: kubernetes-dashboard-auth
+          port: 8000
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/v1/login
+      backendRefs:
+        - name: kubernetes-dashboard-auth
+          port: 8000
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/v1/me
+      backendRefs:
+        - name: kubernetes-dashboard-auth
+          port: 8000
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+      backendRefs:
+        - name: kubernetes-dashboard-api
+          port: 8000
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /metrics
+      backendRefs:
+        - name: kubernetes-dashboard-api
+          port: 8000
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: kubernetes-dashboard-web
+          port: 8000

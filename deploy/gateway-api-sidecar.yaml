@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyperway
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hyperway
+  template:
+    metadata:
+      labels:
+        app: hyperway
+    spec:
+      serviceAccountName: hyperway
+      containers:
+        - name: proxy
+          image: quay.io/arloor/hyperway:latest
+          args:
+            - "--gateway-api-snapshot-name=default"
+            - "--gateway-api-snapshot-namespace=default"
+            - "--gateway-api-snapshot-poll-seconds=3"
+          ports:
+            - name: http
+              containerPort: 80
+        - name: gateway-controller
+          image: quay.io/arloor/hyperway:latest
+          command: ["/hyperway_controller"]
+          args:
+            - "--gateway-api-snapshot-name=default"
+            - "--gateway-api-snapshot-namespace=default"
+            - "--gateway-api-k8s-namespace=default"
+            - "--gateway-api-k8s-poll-seconds=15"
+            - "--gateway-api-k8s-controller-name=hyperway.arloor.dev/gateway-controller"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyperway
+  namespace: default
+spec:
+  selector:
+    app: hyperway
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
