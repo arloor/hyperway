@@ -20,7 +20,7 @@ use crate::gateway_api_snapshot_sync::spawn_gateway_api_snapshot_sync;
 use crate::proxy::ProxyHandler;
 
 use axum::response::IntoResponse;
-use axum_bootstrap::{InterceptResult, ReqInterceptor, TlsParam};
+use axum_bootstrap::{InterceptResult, ReqInterceptor};
 use config::load_config;
 use futures_util::future::join_all;
 use log::{error, info, warn};
@@ -35,7 +35,7 @@ use tokio_rustls::rustls::{
     sign::CertifiedKey,
 };
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error as StdError;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
@@ -95,13 +95,6 @@ impl ReqInterceptor for ProxyInterceptor {
 }
 
 #[derive(Clone)]
-struct ListenerTlsMaterial {
-    cert_path: String,
-    key_path: String,
-    fingerprint: String,
-}
-
-#[derive(Clone)]
 struct ListenerTlsSniEntry {
     listener_name: String,
     listener_hostname: Option<String>,
@@ -118,14 +111,12 @@ struct ListenerTlsMultiMaterial {
 
 #[derive(Clone)]
 enum DesiredTls {
-    Single(ListenerTlsMaterial),
     Multi(ListenerTlsMultiMaterial),
 }
 
 impl DesiredTls {
     fn fingerprint(&self) -> &str {
         match self {
-            Self::Single(material) => &material.fingerprint,
             Self::Multi(material) => &material.fingerprint,
         }
     }
@@ -254,28 +245,6 @@ fn build_desired_listeners(proxy_handler: &Arc<ProxyHandler>) -> Result<BTreeMap
     build_desired_listeners_from_configs(listeners)
 }
 
-fn materialize_tls_files(
-    listener_name: &str, port: u16, cert_pem: &str, key_pem: &str,
-) -> Result<ListenerTlsMaterial, DynError> {
-    let fingerprint = tls_fingerprint(cert_pem, key_pem);
-
-    let base_dir = std::path::Path::new("/tmp/hyperway/tls");
-    std::fs::create_dir_all(base_dir)?;
-
-    let sanitized_name = sanitize_listener_name(listener_name);
-    let cert_path = base_dir.join(format!("{port}-{sanitized_name}-{fingerprint}.crt.pem"));
-    let key_path = base_dir.join(format!("{port}-{sanitized_name}-{fingerprint}.key.pem"));
-
-    std::fs::write(&cert_path, cert_pem)?;
-    std::fs::write(&key_path, key_pem)?;
-
-    Ok(ListenerTlsMaterial {
-        cert_path: cert_path.to_string_lossy().to_string(),
-        key_path: key_path.to_string_lossy().to_string(),
-        fingerprint,
-    })
-}
-
 fn tls_fingerprint(cert_pem: &str, key_pem: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     cert_pem.hash(&mut hasher);
@@ -380,36 +349,6 @@ fn build_desired_listeners_from_configs(
         }
 
         if !tls_candidates.is_empty() {
-            let fingerprints = tls_candidates
-                .iter()
-                .map(|candidate| tls_fingerprint(&candidate.cert_pem, &candidate.key_pem))
-                .collect::<HashSet<_>>();
-
-            if fingerprints.len() == 1 {
-                let candidate = tls_candidates
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| format!("missing tls candidate on port {port}"))?;
-                let tls = Some(DesiredTls::Single(materialize_tls_files(
-                    &candidate.listener_name,
-                    port,
-                    &candidate.cert_pem,
-                    &candidate.key_pem,
-                )?));
-                let mut names = tls_names;
-                names.sort();
-                names.dedup();
-                desired.insert(
-                    port,
-                    DesiredListener {
-                        name: names.join(","),
-                        port,
-                        tls,
-                    },
-                );
-                continue;
-            }
-
             let mut entries = tls_candidates
                 .into_iter()
                 .map(|candidate| ListenerTlsSniEntry {
@@ -453,18 +392,6 @@ fn build_desired_listeners_from_configs(
     }
 
     Ok(desired)
-}
-
-fn sanitize_listener_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() { "listener".to_string() } else { out }
 }
 
 fn load_certified_key(cert_pem: &str, key_pem: &str, provider: &CryptoProvider) -> Result<CertifiedKey, DynError> {
@@ -627,22 +554,11 @@ fn spawn_listener_task(
         };
     }
 
-    let tls_param = match desired.tls.as_ref() {
-        Some(DesiredTls::Single(tls)) => Some(TlsParam {
-            tls: true,
-            cert: tls.cert_path.clone(),
-            key: tls.key_path.clone(),
-        }),
-        _ => None,
-    };
-    let default_scheme = if tls_param.is_some() { "https" } else { "http" };
-
     let server = axum_bootstrap::new_server(desired.port, build_router(), shutdown_rx)
         .with_timeout(IDLE_TIMEOUT)
-        .with_tls_param(tls_param)
         .with_interceptor(ProxyInterceptor {
             proxy_handler,
-            default_scheme,
+            default_scheme: "http",
             listener_port: desired.port,
         });
 
@@ -883,7 +799,10 @@ mod tests {
             Some(listener) => listener,
             None => panic!("listener on port 443 should exist"),
         };
-        assert!(matches!(listener.tls.as_ref(), Some(DesiredTls::Single(_))));
+        match listener.tls.as_ref() {
+            Some(DesiredTls::Multi(material)) => assert_eq!(material.entries.len(), 2),
+            _ => panic!("listener should use multi-cert tls material"),
+        }
     }
 
     #[test]
