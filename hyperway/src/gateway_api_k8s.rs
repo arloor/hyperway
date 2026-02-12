@@ -1,7 +1,7 @@
 use crate::DynError;
 use crate::config::GatewayApiK8sSyncConfig;
 use crate::gateway_api::{GatewayApiParseOptions, parse_gateway_api_runtime_from_str_with_options};
-use crate::gateway_runtime::GatewayRuntime;
+use crate::gateway_runtime::{GatewayClassStatusV1, GatewayListenerStatusV1, GatewayRuntime, RouteParentDiagnosticV1};
 use crate::proxy::ProxyHandler;
 use base64::Engine;
 use chrono::{SecondsFormat, Utc};
@@ -86,6 +86,18 @@ struct GatewayClassResource {
 struct GatewaySpec {
     #[serde(default)]
     gateway_class_name: Option<String>,
+    #[serde(default)]
+    addresses: Vec<GatewayAddressSpec>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GatewayAddressSpec {
+    #[serde(rename = "type")]
+    #[serde(default)]
+    address_type: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -99,39 +111,18 @@ struct GatewayResource {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ParentRef {
-    #[serde(default)]
-    group: Option<String>,
-    #[serde(default)]
-    kind: Option<String>,
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    namespace: Option<String>,
-    #[serde(default)]
-    section_name: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct HttpRouteSpec {
-    #[serde(default)]
-    parent_refs: Vec<ParentRef>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct HttpRouteResource {
     #[serde(default)]
     metadata: ObjectMeta,
-    #[serde(default)]
-    spec: HttpRouteSpec,
 }
 
 struct GatewayApiSnapshot {
     gateway_classes_raw: Vec<Value>,
     gateways_raw: Vec<Value>,
     http_routes_raw: Vec<Value>,
+    namespaces_raw: Vec<Value>,
+    services_raw: Vec<Value>,
+    reference_grants_raw: Vec<Value>,
     gateway_classes: Vec<GatewayClassResource>,
     gateways: Vec<GatewayResource>,
     http_routes: Vec<HttpRouteResource>,
@@ -145,6 +136,9 @@ impl GatewayApiSnapshot {
             .iter()
             .chain(self.gateways_raw.iter())
             .chain(self.http_routes_raw.iter())
+            .chain(self.namespaces_raw.iter())
+            .chain(self.services_raw.iter())
+            .chain(self.reference_grants_raw.iter())
         {
             docs.push_str("---\n");
             docs.push_str(&serde_yaml_bw::to_string(item)?);
@@ -279,7 +273,7 @@ async fn sync_once(sync_target: &SyncTarget, context: &K8sApiContext) -> Result<
         },
     )?;
     context.resolve_listener_tls(&mut runtime).await?;
-    let apply_stats = apply_sync_target(sync_target, context, runtime).await?;
+    let apply_stats = apply_sync_target(sync_target, context, runtime.clone()).await?;
     info!(
         "Kubernetes Gateway API sync applied, locations={}, listeners={}, gateways={}, httproutes={}",
         apply_stats.location_count,
@@ -287,7 +281,7 @@ async fn sync_once(sync_target: &SyncTarget, context: &K8sApiContext) -> Result<
         snapshot.gateways.len(),
         snapshot.http_routes.len()
     );
-    if let Err(err) = context.sync_controller_status(&snapshot).await {
+    if let Err(err) = context.sync_controller_status(&snapshot, &runtime).await {
         warn!("failed to patch Gateway API status: {err}");
     }
     Ok(())
@@ -304,7 +298,8 @@ async fn apply_sync_target(
                 && guard.is_some_and(|cached_hash| cached_hash == hash)
             {
                 return Ok(crate::proxy::GatewayRuntimeApplyStats {
-                    location_count: runtime.locations.values().map(std::vec::Vec::len).sum(),
+                    location_count: runtime.locations.values().map(std::vec::Vec::len).sum::<usize>()
+                        + runtime.http_routes_v1.len(),
                     listener_count: runtime.listeners.len(),
                 });
             }
@@ -313,7 +308,8 @@ async fn apply_sync_target(
                 *guard = Some(hash);
             }
             Ok(crate::proxy::GatewayRuntimeApplyStats {
-                location_count: runtime.locations.values().map(std::vec::Vec::len).sum(),
+                location_count: runtime.locations.values().map(std::vec::Vec::len).sum::<usize>()
+                    + runtime.http_routes_v1.len(),
                 listener_count: runtime.listeners.len(),
             })
         }
@@ -383,6 +379,28 @@ impl K8sApiContext {
         let gateway_classes_raw = self.fetch_cluster_resource_items("gatewayclasses").await?;
         let gateways_raw = self.fetch_resource_items("gateways").await?;
         let http_routes_raw = self.fetch_resource_items("httproutes").await?;
+        let namespaces_raw = self
+            .fetch_core_cluster_resource_items("namespaces")
+            .await
+            .unwrap_or_else(|err| {
+                warn!("fetch namespaces failed: {err}");
+                Vec::new()
+            });
+        let services_raw = self.fetch_core_resource_items("services").await.unwrap_or_else(|err| {
+            warn!("fetch services failed: {err}");
+            Vec::new()
+        });
+        let reference_grants_raw = self
+            .fetch_gateway_resource_items_with_fallback(
+                "referencegrants",
+                self.namespace.as_deref(),
+                &["v1", "v1beta1", "v1alpha2"],
+            )
+            .await
+            .unwrap_or_else(|err| {
+                warn!("fetch referencegrants failed: {err}");
+                Vec::new()
+            });
 
         Ok(GatewayApiSnapshot {
             gateway_classes: parse_k8s_items("gatewayclasses", &gateway_classes_raw)?,
@@ -391,6 +409,9 @@ impl K8sApiContext {
             gateway_classes_raw,
             gateways_raw,
             http_routes_raw,
+            namespaces_raw,
+            services_raw,
+            reference_grants_raw,
         })
     }
 
@@ -404,6 +425,32 @@ impl K8sApiContext {
 
     async fn fetch_cluster_resource_items(&self, resource: &str) -> Result<Vec<Value>, DynError> {
         self.fetch_items_by_path(&build_cluster_resource_path(resource)).await
+    }
+
+    async fn fetch_core_resource_items(&self, resource: &str) -> Result<Vec<Value>, DynError> {
+        self.fetch_items_by_path(&build_core_resource_path(self.namespace.as_deref(), resource))
+            .await
+    }
+
+    async fn fetch_core_cluster_resource_items(&self, resource: &str) -> Result<Vec<Value>, DynError> {
+        self.fetch_items_by_path(&build_core_cluster_resource_path(resource))
+            .await
+    }
+
+    async fn fetch_gateway_resource_items_with_fallback(
+        &self, resource: &str, namespace: Option<&str>, versions: &[&str],
+    ) -> Result<Vec<Value>, DynError> {
+        let mut last_err = None::<DynError>;
+        for version in versions {
+            let path = build_gateway_resource_path_by_version(namespace, resource, version);
+            match self.fetch_items_by_path(&path).await {
+                Ok(items) => return Ok(items),
+                Err(err) => {
+                    last_err = Some(err);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| format!("no available gateway api version for resource {resource}").into()))
     }
 
     async fn fetch_items_by_path(&self, path: &str) -> Result<Vec<Value>, DynError> {
@@ -544,6 +591,10 @@ impl K8sApiContext {
                 "checksum": checksum,
                 "locations": &runtime.locations,
                 "listeners": &runtime.listeners,
+                "httpRoutesV1": &runtime.http_routes_v1,
+                "routeDiagnostics": &runtime.route_diagnostics,
+                "gatewayListenerStatuses": &runtime.gateway_listener_statuses,
+                "gatewayClassStatuses": &runtime.gateway_class_statuses,
             }
         });
         let item_path = build_snapshot_item_path(namespace, name);
@@ -689,7 +740,15 @@ impl K8sApiContext {
         Ok(())
     }
 
-    async fn sync_controller_status(&self, snapshot: &GatewayApiSnapshot) -> Result<(), DynError> {
+    async fn sync_controller_status(
+        &self, snapshot: &GatewayApiSnapshot, runtime: &GatewayRuntime,
+    ) -> Result<(), DynError> {
+        let runtime_gateway_class_statuses = runtime
+            .gateway_class_statuses
+            .iter()
+            .map(|status| (status.name.clone(), status))
+            .collect::<HashMap<_, _>>();
+
         let owned_gateway_classes = snapshot
             .gateway_classes
             .iter()
@@ -708,10 +767,23 @@ impl K8sApiContext {
             .iter()
             .filter(|gateway_class| owned_gateway_classes.contains(&gateway_class.metadata.name))
         {
-            self.patch_gateway_class_status(gateway_class).await?;
+            self.patch_gateway_class_status(
+                gateway_class,
+                runtime_gateway_class_statuses
+                    .get(&gateway_class.metadata.name)
+                    .copied(),
+            )
+            .await?;
         }
 
-        let mut owned_gateway_keys = HashSet::<String>::new();
+        let mut listener_statuses_by_gateway = HashMap::<String, Vec<&GatewayListenerStatusV1>>::new();
+        for listener_status in &runtime.gateway_listener_statuses {
+            listener_statuses_by_gateway
+                .entry(resource_key(&listener_status.gateway_namespace, &listener_status.gateway_name))
+                .or_default()
+                .push(listener_status);
+        }
+
         for gateway in snapshot.gateways.iter() {
             if gateway.metadata.name.is_empty() {
                 continue;
@@ -723,8 +795,20 @@ impl K8sApiContext {
                 continue;
             }
             let namespace = resource_namespace(&gateway.metadata);
-            owned_gateway_keys.insert(resource_key(&namespace, &gateway.metadata.name));
-            self.patch_gateway_status(gateway).await?;
+            let gateway_key = resource_key(&namespace, &gateway.metadata.name);
+            let listener_statuses = listener_statuses_by_gateway
+                .get(&gateway_key)
+                .cloned()
+                .unwrap_or_default();
+            self.patch_gateway_status(gateway, listener_statuses).await?;
+        }
+
+        let mut diagnostics_by_route = HashMap::<String, Vec<&RouteParentDiagnosticV1>>::new();
+        for diagnostic in &runtime.route_diagnostics {
+            diagnostics_by_route
+                .entry(resource_key(&diagnostic.route_namespace, &diagnostic.route_name))
+                .or_default()
+                .push(diagnostic);
         }
 
         for (route, route_raw) in snapshot.http_routes.iter().zip(snapshot.http_routes_raw.iter()) {
@@ -732,7 +816,52 @@ impl K8sApiContext {
                 continue;
             }
             let route_namespace = resource_namespace(&route.metadata);
-            let owned_parent_statuses = self.build_route_parent_statuses(route, &owned_gateway_keys);
+            let route_key = resource_key(&route_namespace, &route.metadata.name);
+            let diagnostics = diagnostics_by_route.get(&route_key).cloned().unwrap_or_default();
+            if diagnostics.is_empty() {
+                continue;
+            }
+
+            let owned_parent_statuses = diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    let mut status_parent_ref = json!({
+                        "group": diagnostic.parent_group,
+                        "kind": diagnostic.parent_kind,
+                        "name": diagnostic.parent_name,
+                    });
+                    if let Some(namespace) = diagnostic.parent_namespace.as_ref() {
+                        status_parent_ref["namespace"] = Value::String(namespace.clone());
+                    }
+                    if let Some(section_name) = diagnostic.parent_section_name.as_ref() {
+                        status_parent_ref["sectionName"] = Value::String(section_name.clone());
+                    }
+                    if let Some(port) = diagnostic.parent_port {
+                        status_parent_ref["port"] = Value::Number(port.into());
+                    }
+                    json!({
+                        "parentRef": status_parent_ref,
+                        "controllerName": self.controller_name,
+                        "conditions": [
+                            self.status_condition(
+                                "Accepted",
+                                if diagnostic.accepted { "True" } else { "False" },
+                                &diagnostic.accepted_reason,
+                                &diagnostic.accepted_message,
+                                diagnostic.observed_generation
+                            ),
+                            self.status_condition(
+                                "ResolvedRefs",
+                                if diagnostic.resolved_refs { "True" } else { "False" },
+                                &diagnostic.resolved_refs_reason,
+                                &diagnostic.resolved_refs_message,
+                                diagnostic.observed_generation
+                            )
+                        ]
+                    })
+                })
+                .collect::<Vec<_>>();
+
             let existing_parent_statuses = extract_route_parent_statuses(route_raw);
             let route_parent_statuses = merge_route_parent_statuses(
                 &self.controller_name,
@@ -749,16 +878,34 @@ impl K8sApiContext {
         Ok(())
     }
 
-    async fn patch_gateway_class_status(&self, gateway_class: &GatewayClassResource) -> Result<(), DynError> {
+    async fn patch_gateway_class_status(
+        &self, gateway_class: &GatewayClassResource, runtime_status: Option<&GatewayClassStatusV1>,
+    ) -> Result<(), DynError> {
+        let accepted = runtime_status.map(|status| status.accepted).unwrap_or(true);
+        let reason = runtime_status
+            .map(|status| status.accepted_reason.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("Accepted");
+        let message = runtime_status
+            .map(|status| status.accepted_message.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("GatewayClass is accepted by hyperway controller");
+        let supported_features = runtime_status
+            .map(|status| status.supported_features.clone())
+            .unwrap_or_default();
+        let observed_generation = runtime_status
+            .and_then(|status| status.observed_generation)
+            .or(gateway_class.metadata.generation);
         let payload = json!({
             "status": {
                 "conditions": [self.status_condition(
                     "Accepted",
-                    "True",
-                    "Accepted",
-                    "GatewayClass is accepted by hyperway controller",
-                    gateway_class.metadata.generation
-                )]
+                    if accepted { "True" } else { "False" },
+                    reason,
+                    message,
+                    observed_generation
+                )],
+                "supportedFeatures": supported_features
             }
         });
         self.patch_status_by_path(
@@ -768,8 +915,55 @@ impl K8sApiContext {
         .await
     }
 
-    async fn patch_gateway_status(&self, gateway: &GatewayResource) -> Result<(), DynError> {
+    async fn patch_gateway_status(
+        &self, gateway: &GatewayResource, listener_statuses: Vec<&GatewayListenerStatusV1>,
+    ) -> Result<(), DynError> {
         let namespace = resource_namespace(&gateway.metadata);
+        let listeners = listener_statuses
+            .iter()
+            .map(|listener| {
+                let supported_kinds = listener
+                    .supported_kinds
+                    .iter()
+                    .map(|kind| {
+                        let mut value = json!({ "kind": kind.kind });
+                        if let Some(group) = kind.group.as_ref() {
+                            value["group"] = Value::String(group.clone());
+                        }
+                        value
+                    })
+                    .collect::<Vec<_>>();
+                json!({
+                    "name": listener.listener_name,
+                    "supportedKinds": supported_kinds,
+                    "attachedRoutes": listener.attached_routes,
+                    "conditions": [
+                        self.status_condition(
+                            "Accepted",
+                            if listener.accepted { "True" } else { "False" },
+                            &listener.accepted_reason,
+                            &listener.accepted_message,
+                            listener.observed_generation
+                        )
+                    ]
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let addresses = gateway
+            .spec
+            .addresses
+            .iter()
+            .filter_map(|address| {
+                let value = address.value.as_ref()?;
+                let mut item = json!({ "value": value });
+                if let Some(address_type) = address.address_type.as_ref() {
+                    item["type"] = Value::String(address_type.clone());
+                }
+                Some(item)
+            })
+            .collect::<Vec<_>>();
+
         let payload = json!({
             "status": {
                 "conditions": [
@@ -787,73 +981,13 @@ impl K8sApiContext {
                         "Gateway has been programmed by hyperway controller",
                         gateway.metadata.generation
                     )
-                ]
+                ],
+                "listeners": listeners,
+                "addresses": addresses
             }
         });
         self.patch_status_by_path(&build_resource_status_path("gateways", &namespace, &gateway.metadata.name), payload)
             .await
-    }
-
-    fn build_route_parent_statuses(
-        &self, route: &HttpRouteResource, owned_gateway_keys: &HashSet<String>,
-    ) -> Vec<Value> {
-        let route_namespace = resource_namespace(&route.metadata);
-        let mut parent_statuses = Vec::<Value>::new();
-        let mut seen_parent_refs = HashSet::<String>::new();
-
-        for parent_ref in route
-            .spec
-            .parent_refs
-            .iter()
-            .filter(|parent_ref| is_gateway_parent_ref(parent_ref))
-        {
-            let parent_namespace = parent_ref.namespace.clone().unwrap_or_else(|| route_namespace.clone());
-            let parent_key = resource_key(&parent_namespace, &parent_ref.name);
-            if !owned_gateway_keys.contains(&parent_key) {
-                continue;
-            }
-
-            let section_name = parent_ref.section_name.clone().unwrap_or_default();
-            let dedupe_key = format!("{parent_namespace}/{}/{}", parent_ref.name, section_name);
-            if !seen_parent_refs.insert(dedupe_key) {
-                continue;
-            }
-
-            let mut status_parent_ref = json!({
-                "group": parent_ref.group.clone().unwrap_or_else(|| "gateway.networking.k8s.io".to_string()),
-                "kind": parent_ref.kind.clone().unwrap_or_else(|| "Gateway".to_string()),
-                "name": parent_ref.name.clone(),
-            });
-            if let Some(namespace) = parent_ref.namespace.as_ref() {
-                status_parent_ref["namespace"] = Value::String(namespace.clone());
-            }
-            if let Some(section_name) = parent_ref.section_name.as_ref() {
-                status_parent_ref["sectionName"] = Value::String(section_name.clone());
-            }
-
-            parent_statuses.push(json!({
-                "parentRef": status_parent_ref,
-                "controllerName": self.controller_name,
-                "conditions": [
-                    self.status_condition(
-                        "Accepted",
-                        "True",
-                        "Accepted",
-                        "HTTPRoute has been accepted by hyperway controller",
-                        route.metadata.generation
-                    ),
-                    self.status_condition(
-                        "ResolvedRefs",
-                        "True",
-                        "ResolvedRefs",
-                        "All referenced backends are resolved by hyperway controller",
-                        route.metadata.generation
-                    )
-                ]
-            }));
-        }
-
-        parent_statuses
     }
 
     async fn patch_http_route_status(
@@ -942,14 +1076,29 @@ fn resource_key(namespace: &str, name: &str) -> String {
 }
 
 fn build_resource_path(namespace: Option<&str>, resource: &str) -> String {
-    match namespace {
-        Some(namespace) => format!("/apis/gateway.networking.k8s.io/v1/namespaces/{namespace}/{resource}"),
-        None => format!("/apis/gateway.networking.k8s.io/v1/{resource}"),
-    }
+    build_gateway_resource_path_by_version(namespace, resource, "v1")
 }
 
 fn build_cluster_resource_path(resource: &str) -> String {
-    format!("/apis/gateway.networking.k8s.io/v1/{resource}")
+    build_gateway_resource_path_by_version(None, resource, "v1")
+}
+
+fn build_gateway_resource_path_by_version(namespace: Option<&str>, resource: &str, version: &str) -> String {
+    match namespace {
+        Some(namespace) => format!("/apis/gateway.networking.k8s.io/{version}/namespaces/{namespace}/{resource}"),
+        None => format!("/apis/gateway.networking.k8s.io/{version}/{resource}"),
+    }
+}
+
+fn build_core_resource_path(namespace: Option<&str>, resource: &str) -> String {
+    match namespace {
+        Some(namespace) => format!("/api/v1/namespaces/{namespace}/{resource}"),
+        None => format!("/api/v1/{resource}"),
+    }
+}
+
+fn build_core_cluster_resource_path(resource: &str) -> String {
+    format!("/api/v1/{resource}")
 }
 
 fn build_resource_status_path(resource: &str, namespace: &str, name: &str) -> String {
@@ -991,7 +1140,14 @@ fn hash_gateway_runtime(runtime: &GatewayRuntime) -> Result<u64, DynError> {
     entries.sort_by(|left, right| left.0.cmp(&right.0));
     let mut listeners = runtime.listeners.clone();
     listeners.sort_by(|left, right| left.port.cmp(&right.port).then_with(|| left.name.cmp(&right.name)));
-    let payload = serde_json::to_vec(&(entries, listeners))?;
+    let payload = serde_json::to_vec(&(
+        entries,
+        listeners,
+        &runtime.http_routes_v1,
+        &runtime.route_diagnostics,
+        &runtime.gateway_listener_statuses,
+        &runtime.gateway_class_statuses,
+    ))?;
     let mut hasher = DefaultHasher::new();
     payload.hash(&mut hasher);
     Ok(hasher.finish())
@@ -1013,12 +1169,6 @@ where
                 .map_err(|err| format!("failed to parse item #{index} in {resource}: {err}").into())
         })
         .collect()
-}
-
-fn is_gateway_parent_ref(parent_ref: &ParentRef) -> bool {
-    let kind = parent_ref.kind.as_deref().unwrap_or("Gateway");
-    let group = parent_ref.group.as_deref().unwrap_or("gateway.networking.k8s.io");
-    kind == "Gateway" && group == "gateway.networking.k8s.io" && !parent_ref.name.is_empty()
 }
 
 fn extract_route_parent_statuses(route_raw: &Value) -> Vec<Value> {

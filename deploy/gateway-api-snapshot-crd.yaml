@@ -37,6 +37,26 @@ spec:
                   items:
                     type: object
                     x-kubernetes-preserve-unknown-fields: true
+                httpRoutesV1:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                routeDiagnostics:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                gatewayListenerStatuses:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                gatewayClassStatuses:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
               required:
                 - locations
             status:

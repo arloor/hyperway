@@ -150,7 +150,35 @@ fn parse_runtime_from_snapshot_spec(spec_value: &Value) -> Result<GatewayRuntime
         None => Vec::new(),
     };
 
-    Ok(GatewayRuntime { locations, listeners })
+    let http_routes_v1 = match spec_value.get("httpRoutesV1") {
+        Some(routes) => serde_json::from_value(routes.clone())
+            .map_err(|err| format!("parse snapshot.spec.httpRoutesV1 failed: {err}"))?,
+        None => Vec::new(),
+    };
+    let route_diagnostics = match spec_value.get("routeDiagnostics") {
+        Some(diagnostics) => serde_json::from_value(diagnostics.clone())
+            .map_err(|err| format!("parse snapshot.spec.routeDiagnostics failed: {err}"))?,
+        None => Vec::new(),
+    };
+    let gateway_listener_statuses = match spec_value.get("gatewayListenerStatuses") {
+        Some(statuses) => serde_json::from_value(statuses.clone())
+            .map_err(|err| format!("parse snapshot.spec.gatewayListenerStatuses failed: {err}"))?,
+        None => Vec::new(),
+    };
+    let gateway_class_statuses = match spec_value.get("gatewayClassStatuses") {
+        Some(statuses) => serde_json::from_value(statuses.clone())
+            .map_err(|err| format!("parse snapshot.spec.gatewayClassStatuses failed: {err}"))?,
+        None => Vec::new(),
+    };
+
+    Ok(GatewayRuntime {
+        locations,
+        listeners,
+        http_routes_v1,
+        route_diagnostics,
+        gateway_listener_statuses,
+        gateway_class_statuses,
+    })
 }
 
 struct SnapshotApiContext {

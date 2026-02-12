@@ -48,6 +48,26 @@ spec:
                   items:
                     type: object
                     x-kubernetes-preserve-unknown-fields: true
+                httpRoutesV1:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                routeDiagnostics:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                gatewayListenerStatuses:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                gatewayClassStatuses:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
               required:
                 - locations
             status:
@@ -102,10 +122,10 @@ metadata:
   name: hyperway-gateway-api-reader
 rules:
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["gatewayclasses", "gateways", "httproutes"]
+    resources: ["gatewayclasses", "gateways", "httproutes", "referencegrants"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
-    resources: ["secrets"]
+    resources: ["secrets", "services", "namespaces"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["gatewayclasses/status", "gateways/status", "httproutes/status"]

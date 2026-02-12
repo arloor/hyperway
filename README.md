@@ -5,9 +5,10 @@
 - 控制器进程：`hyperway_controller`（仅 Snapshot/CRD 模式使用）
 
 核心能力：
-- 解析 `GatewayClass` / `Gateway` / `HTTPRoute`
+- 解析 `GatewayClass` / `Gateway` / `HTTPRoute`（v1.1 Core+Extended）
 - 根据 `Gateway.listeners` 动态增删监听端口
 - 根据 `listeners[*].tls.certificateRefs` 读取 Secret 并启用 TLS
+- 执行 `HTTPRoute` 匹配与过滤：`path/method/header/query`、加权 `backendRefs`、`Request/ResponseHeaderModifier`、`RequestRedirect`、`URLRewrite`、`RequestMirror`、`timeouts`、`retry`
 - 支持两种运行模式：
   - 模式 A：`controller + RouteSnapshot CRD + proxy`
   - 模式 B：`single-process direct K8s API`
@@ -39,7 +40,7 @@
 | 进程拓扑 | 双进程：`hyperway_controller` + `hyperway` | 单进程：仅 `hyperway` |
 | 是否需要 CRD | 需要 `RouteSnapshot` CRD | 不需要 |
 | 是否需要 `hyperway_controller` | 需要 | 不需要 |
-| RBAC 重点权限 | `gatewayclasses/gateways/httproutes`、`secrets`、`routesnapshots`（含 status） | `gatewayclasses/gateways/httproutes`、`secrets`（无 `routesnapshots` 相关权限） |
+| RBAC 重点权限 | `gatewayclasses/gateways/httproutes/referencegrants`、`secrets/services/namespaces`、`routesnapshots`（含 status） | `gatewayclasses/gateways/httproutes/referencegrants`、`secrets/services/namespaces`（无 `routesnapshots` 相关权限） |
 | 同步机制 | controller 侧：Gateway API watch + poll；proxy 侧：`RouteSnapshot` poll | `hyperway` 直接对 Gateway API watch + poll |
 | 故障影响面 | controller 故障会停止新快照写入，但已有快照仍可被 proxy 使用 | 单进程故障会同时影响流量转发与配置同步 |
 | 适用场景 | 控制面与数据面解耦、希望通过 CRD 观察中间态 | 部署更轻量、无需 CRD、调试或小规模环境 |
@@ -127,7 +128,7 @@ hyperway \
 
 - 无需 `RouteSnapshot` CRD。
 - 无需独立 `hyperway_controller` 进程。
-- RBAC 应聚焦于 Gateway API 与 Secret 读取及状态更新；最小权限原则下可去掉 `routesnapshots` 与 `routesnapshots/status` 相关权限。
+- RBAC 应聚焦于 Gateway API、ReferenceGrant、Namespace/Service/Secret 读取及状态更新；最小权限原则下可去掉 `routesnapshots` 与 `routesnapshots/status` 相关权限。
 
 ### 启动参数
 
@@ -174,7 +175,10 @@ kubectl apply -f deploy/gateway-api-demo.yaml
 - 仅 `HTTPS`/`TLS` listener 会启用 TLS。
 - 证书来源：`Gateway.listeners[*].tls.certificateRefs` 指向的 `Secret`。
 - Secret 需包含 `tls.crt` 和 `tls.key`。
-- 同一端口若配置多个 listener，当前实现会按稳定顺序保留一个并记录告警。
+- 同一端口可配置多个 listener：
+  - 同端口多个 `HTTP` listener：支持（按 host/route 匹配）。
+  - 同端口多个 `HTTPS` listener：支持；证书不同场景通过 SNI 选择证书（优先精确 hostname，再通配符，再默认证书）。
+  - 同端口混合 `HTTP` 和 `HTTPS`：拒绝并在 listener status 标记 `PortConflict`。
 
 ## 运维接口
 
@@ -198,6 +202,6 @@ cargo test -p hyperway
   - 先确认 controller 正常运行且有 `routesnapshots` 的写权限。
   - 再确认 `--gateway-api-snapshot-name/namespace` 两边一致。
 - 直连模式下路由未生效（模式 B）：
-  - 检查 ServiceAccount 是否有 `gatewayclasses/gateways/httproutes/secrets` 的读取权限及相关 status patch 权限。
+  - 检查 ServiceAccount 是否有 `gatewayclasses/gateways/httproutes/referencegrants` 与 `services/namespaces/secrets` 的读取权限及相关 status patch 权限。
   - 检查 `--gateway-api-k8s-controller-name` 是否与目标 `GatewayClass.spec.controllerName` 一致。
   - 检查 `--gateway-api-k8s-namespace` 是否覆盖目标 Gateway/HTTPRoute 所在命名空间。
