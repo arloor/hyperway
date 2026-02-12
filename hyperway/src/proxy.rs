@@ -551,9 +551,10 @@ fn build_upstream_req_v1_buffered(
     path: &str, query: Option<&str>, body: Bytes, original_scheme_host_port: &SchemeHostPort, request_host: &str,
 ) -> io::Result<Request<BoxBody<Bytes, io::Error>>> {
     let upstream_uri = build_upstream_uri(selected, backend, path, query)?;
+    let upstream_version = normalize_upstream_version(version, &upstream_uri);
     let mut req_builder = Request::builder()
         .method(method.clone())
-        .version(version)
+        .version(upstream_version)
         .uri(upstream_uri);
     let req_headers = req_builder
         .headers_mut()
@@ -605,7 +606,11 @@ fn build_upstream_req_v1_streaming(
     let query = req.uri().query().map(str::to_string);
 
     let upstream_uri = build_upstream_uri(selected, backend, &path, query.as_deref())?;
-    let mut builder = Request::builder().method(method).version(version).uri(upstream_uri);
+    let upstream_version = normalize_upstream_version(version, &upstream_uri);
+    let mut builder = Request::builder()
+        .method(method)
+        .version(upstream_version)
+        .uri(upstream_uri);
     let new_headers = builder
         .headers_mut()
         .ok_or_else(|| io::Error::other("headers_mut returned None"))?;
@@ -659,6 +664,17 @@ fn build_upstream_uri(
 
     let uri = format!("http://{}.{}.svc.cluster.local:{}{}", backend.name, backend.namespace, backend.port, rewritten);
     Uri::from_str(&uri).map_err(|err| io::Error::new(ErrorKind::InvalidData, err))
+}
+
+fn normalize_upstream_version(request_version: Version, upstream_uri: &Uri) -> Version {
+    if request_version == Version::HTTP_2
+        && upstream_uri
+            .scheme_str()
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
+    {
+        return Version::HTTP_2;
+    }
+    Version::HTTP_11
 }
 
 fn rewrite_path(
@@ -1018,4 +1034,23 @@ fn spawn_websocket_tunnel(
             (_, Err(err)) => warn!("[{scenario}] websocket upstream upgrade error: {err}"),
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_upstream_version_forces_http11_on_http_uri() {
+        let uri = Uri::from_static("http://svc.default.svc.cluster.local:80/");
+        assert_eq!(normalize_upstream_version(Version::HTTP_2, &uri), Version::HTTP_11);
+        assert_eq!(normalize_upstream_version(Version::HTTP_11, &uri), Version::HTTP_11);
+    }
+
+    #[test]
+    fn normalize_upstream_version_keeps_http2_on_https_uri() {
+        let uri = Uri::from_static("https://svc.default.svc.cluster.local:443/");
+        assert_eq!(normalize_upstream_version(Version::HTTP_2, &uri), Version::HTTP_2);
+        assert_eq!(normalize_upstream_version(Version::HTTP_11, &uri), Version::HTTP_11);
+    }
 }
