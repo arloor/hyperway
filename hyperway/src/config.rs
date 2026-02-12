@@ -154,9 +154,9 @@ pub(crate) fn load_config(param: Param) -> Result<Config, DynError> {
 
 fn log_config(config: &Config) {
     info!(
-        "gateway runtime loaded: listeners={}, host entries={}",
+        "gateway runtime loaded: listeners={}, route_rules={}",
         config.initial_runtime.listeners.len(),
-        config.initial_runtime.locations.len()
+        config.initial_runtime.http_routes_v1.len()
     );
     if let Some(sync_config) = &config.gateway_api_k8s_sync {
         info!(

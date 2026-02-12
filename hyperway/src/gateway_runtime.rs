@@ -1,11 +1,7 @@
-use crate::location::LocationConfig;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct GatewayRuntime {
-    #[serde(default)]
-    pub(crate) locations: HashMap<String, Vec<LocationConfig>>,
     #[serde(default)]
     pub(crate) listeners: Vec<GatewayListenerConfig>,
     #[serde(default)]

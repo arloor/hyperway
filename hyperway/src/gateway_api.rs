@@ -6,7 +6,6 @@ use crate::gateway_runtime::{
     HttpRequestRedirectV1, HttpRetryPolicyV1, HttpRouteMatchV1, HttpRouteRuleV1, HttpStringMatchTypeV1,
     HttpUrlRewriteV1, RouteGroupKindV1, RouteParentDiagnosticV1, WeightedBackendRefV1,
 };
-use crate::location::{DEFAULT_HOST, LocationConfig, LocationPathMatch, Upstream, Version};
 use log::{info, warn};
 use serde::Deserialize;
 use serde_yaml_bw::Value;
@@ -678,7 +677,6 @@ pub(crate) fn parse_gateway_api_runtime_from_str_with_options(
     listeners.sort_by(|left, right| left.port.cmp(&right.port).then_with(|| left.name.cmp(&right.name)));
     listeners.dedup();
 
-    let mut locations = HashMap::<String, Vec<LocationConfig>>::new();
     let mut http_routes_v1 = Vec::<HttpRouteRuleV1>::new();
     let mut route_diagnostics = Vec::<RouteParentDiagnosticV1>::new();
     let mut listener_attached_routes = HashMap::<String, HashSet<String>>::new();
@@ -848,7 +846,6 @@ pub(crate) fn parse_gateway_api_runtime_from_str_with_options(
                     };
                     http_routes_v1.push(runtime_rule);
 
-                    compile_legacy_locations(&mut locations, &bound_hostnames, &route, &compiled_rule);
                     listener_attached = true;
                 }
 
@@ -942,15 +939,13 @@ pub(crate) fn parse_gateway_api_runtime_from_str_with_options(
     }
 
     info!(
-        "parsed Gateway API resources: gateways={}, host entries={}, listeners={}, route_rules={}",
+        "parsed Gateway API resources: gateways={}, listeners={}, route_rules={}",
         owned_gateways.len(),
-        locations.len(),
         listeners.len(),
         http_routes_v1.len()
     );
 
     Ok(GatewayRuntime {
-        locations,
         listeners,
         http_routes_v1,
         route_diagnostics,
@@ -1359,84 +1354,6 @@ fn compile_backend_ref(
     })
 }
 
-fn compile_legacy_locations(
-    locations: &mut HashMap<String, Vec<LocationConfig>>, hosts: &[String], route: &HttpRoute,
-    compiled_rule: &CompiledRule,
-) {
-    if compiled_rule.request_redirect.is_some()
-        || compiled_rule.backends.len() != 1
-        || compiled_rule.request_header_modifier.is_some()
-        || compiled_rule.response_header_modifier.is_some()
-        || !compiled_rule.request_mirrors.is_empty()
-        || compiled_rule.retry.is_some()
-        || compiled_rule.request_timeout_ms.is_some()
-        || compiled_rule.backend_request_timeout_ms.is_some()
-    {
-        return;
-    }
-
-    let Some(backend) = compiled_rule.backends.first() else {
-        return;
-    };
-
-    let backend_base_url = format!("http://{}.{}.svc.cluster.local:{}", backend.name, backend.namespace, backend.port);
-
-    for route_match in &compiled_rule.matches {
-        if !route_match.headers.is_empty() || !route_match.query_params.is_empty() || route_match.method.is_some() {
-            continue;
-        }
-
-        let (location, match_type) = match route_match.path.as_ref() {
-            Some(path) => {
-                let match_type = match path.match_type {
-                    HttpPathMatchTypeV1::Exact => LocationPathMatch::Exact,
-                    HttpPathMatchTypeV1::PathPrefix => LocationPathMatch::Prefix,
-                    HttpPathMatchTypeV1::RegularExpression => continue,
-                };
-                (path.value.clone(), match_type)
-            }
-            None => ("/".to_string(), LocationPathMatch::Prefix),
-        };
-
-        let upstream_path = compiled_rule
-            .url_rewrite
-            .as_ref()
-            .and_then(|rewrite| rewrite.path.as_ref())
-            .and_then(|path| match path.modifier_type {
-                HttpPathModifierTypeV1::ReplacePrefixMatch => path.replace_prefix_match.clone(),
-                HttpPathModifierTypeV1::ReplaceFullPath if match_type == LocationPathMatch::Exact => {
-                    path.replace_full_path.clone()
-                }
-                _ => None,
-            })
-            .unwrap_or_else(|| location.clone());
-
-        let upstream_url_base = join_url_base(&backend_base_url, &upstream_path);
-
-        for host in hosts {
-            locations
-                .entry(host.clone())
-                .or_default()
-                .push(LocationConfig::ReverseProxy {
-                    location: location.clone(),
-                    match_type,
-                    upstream: Upstream {
-                        url_base: upstream_url_base.clone(),
-                        version: Version::Auto,
-                        headers: None,
-                    },
-                });
-        }
-    }
-
-    if compiled_rule.matches.is_empty() {
-        warn!(
-            "HTTPRoute {}/{} compiled with empty matches, legacy locations fallback skipped",
-            route.metadata.namespace, route.metadata.name
-        );
-    }
-}
-
 fn parse_listener_tls(listener: &GatewayListener, gateway: &Gateway) -> GatewayListenerTlsConfig {
     let mut certificate_refs = Vec::<GatewaySecretRef>::new();
     let refs = listener
@@ -1636,7 +1553,7 @@ fn resolve_route_hostnames_for_listener(route_hostnames: &[String], listener_hos
     if route_patterns.is_empty() {
         return match listener_pattern {
             Some(listener) => vec![listener],
-            None => vec![DEFAULT_HOST.to_string()],
+            None => vec!["*".to_string()],
         };
     }
 
@@ -1787,21 +1704,6 @@ fn normalize_path(path: &str) -> String {
     }
 }
 
-fn join_url_base(base: &str, path: &str) -> String {
-    let path = normalize_path(path);
-    if path == "/" {
-        if base.ends_with('/') {
-            base.to_string()
-        } else {
-            format!("{base}/")
-        }
-    } else if base.ends_with('/') {
-        format!("{base}{}", path.trim_start_matches('/'))
-    } else {
-        format!("{base}{path}")
-    }
-}
-
 fn default_namespace() -> String {
     "default".to_string()
 }
@@ -1860,19 +1762,9 @@ spec:
         assert_eq!(runtime.http_routes_v1.len(), 1);
         assert_eq!(runtime.http_routes_v1[0].listener_port, 80);
         assert_eq!(runtime.http_routes_v1[0].hostnames, vec!["app.example.com".to_string()]);
-        let host_locations = match runtime.locations.get("app.example.com") {
-            Some(host_locations) => host_locations,
-            None => panic!("host should exist"),
-        };
-        assert_eq!(host_locations.len(), 1);
-        let LocationConfig::ReverseProxy {
-            location,
-            match_type,
-            upstream,
-        } = &host_locations[0];
-        assert_eq!(location, "/api");
-        assert_eq!(*match_type, LocationPathMatch::Prefix);
-        assert_eq!(upstream.url_base, "http://app-svc.demo.svc.cluster.local:8080/api");
+        assert_eq!(runtime.http_routes_v1[0].matches.len(), 1);
+        let path = runtime.http_routes_v1[0].matches[0].path.as_ref();
+        assert!(path.is_some());
     }
 
     #[test]
@@ -1953,8 +1845,9 @@ spec:
             Ok(runtime) => runtime,
             Err(err) => panic!("parse should succeed: {err}"),
         };
-        assert!(runtime.locations.contains_key("good.example.com"));
-        assert!(!runtime.locations.contains_key("bad.example.com"));
+        assert_eq!(runtime.http_routes_v1.len(), 1);
+        assert_eq!(runtime.http_routes_v1[0].route_name, "good-route");
+        assert_eq!(runtime.http_routes_v1[0].hostnames, vec!["good.example.com".to_string()]);
         assert_eq!(runtime.listeners.len(), 1);
         assert_eq!(runtime.gateway_class_statuses.len(), 1);
         assert_eq!(runtime.gateway_class_statuses[0].name, "owned");
@@ -2009,18 +1902,13 @@ spec:
             Ok(runtime) => runtime,
             Err(err) => panic!("parse should succeed: {err}"),
         };
-        let host_locations = match runtime.locations.get("exact.example.com") {
-            Some(host_locations) => host_locations,
-            None => panic!("host should exist"),
-        };
-        let LocationConfig::ReverseProxy {
-            location,
-            match_type,
-            upstream,
-        } = &host_locations[0];
-        assert_eq!(location, "/old");
-        assert_eq!(*match_type, LocationPathMatch::Exact);
-        assert_eq!(upstream.url_base, "http://exact-svc.default.svc.cluster.local:9000/new");
+        assert_eq!(runtime.http_routes_v1.len(), 1);
+        let route = &runtime.http_routes_v1[0];
+        assert_eq!(route.hostnames, vec!["exact.example.com".to_string()]);
+        let path = route.matches[0].path.as_ref();
+        assert!(path.is_some());
+        let rewrite = route.url_rewrite.as_ref();
+        assert!(rewrite.is_some());
     }
 
     #[test]

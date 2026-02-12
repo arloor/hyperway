@@ -9,6 +9,7 @@
 - 根据 `Gateway.listeners` 动态增删监听端口
 - 根据 `listeners[*].tls.certificateRefs` 读取 Secret 并启用 TLS
 - 执行 `HTTPRoute` 匹配与过滤：`path/method/header/query`、加权 `backendRefs`、`Request/ResponseHeaderModifier`、`RequestRedirect`、`URLRewrite`、`RequestMirror`、`timeouts`、`retry`
+- 数据面仅执行 `httpRoutesV1` 运行时模型，不再包含 legacy `locations` 回退链路
 - 支持两种运行模式：
   - 模式 A：`controller + RouteSnapshot CRD + proxy`
   - 模式 B：`single-process direct K8s API`

@@ -49,12 +49,12 @@ pub(crate) fn spawn_gateway_api_snapshot_sync(
             }
             Ok(SnapshotSyncState::Unchanged) => {}
             Ok(SnapshotSyncState::Applied {
-                location_count,
+                route_count,
                 listener_count,
             }) => {
                 info!(
-                    "Gateway API snapshot sync applied from {}/{}, locations={}, listeners={}",
-                    context.namespace, context.name, location_count, listener_count
+                    "Gateway API snapshot sync applied from {}/{}, route_rules={}, listeners={}",
+                    context.namespace, context.name, route_count, listener_count
                 );
                 snapshot_missing_logged = false;
             }
@@ -76,12 +76,12 @@ pub(crate) fn spawn_gateway_api_snapshot_sync(
                 }
                 Ok(SnapshotSyncState::Unchanged) => {}
                 Ok(SnapshotSyncState::Applied {
-                    location_count,
+                    route_count,
                     listener_count,
                 }) => {
                     info!(
-                        "Gateway API snapshot sync applied from {}/{}, locations={}, listeners={}",
-                        context.namespace, context.name, location_count, listener_count
+                        "Gateway API snapshot sync applied from {}/{}, route_rules={}, listeners={}",
+                        context.namespace, context.name, route_count, listener_count
                     );
                     snapshot_missing_logged = false;
                 }
@@ -96,10 +96,7 @@ pub(crate) fn spawn_gateway_api_snapshot_sync(
 enum SnapshotSyncState {
     Missing,
     Unchanged,
-    Applied {
-        location_count: usize,
-        listener_count: usize,
-    },
+    Applied { route_count: usize, listener_count: usize },
 }
 
 async fn sync_once(
@@ -129,21 +126,12 @@ async fn sync_once(
     }
 
     Ok(SnapshotSyncState::Applied {
-        location_count: apply_stats.location_count,
+        route_count: apply_stats.route_count,
         listener_count: apply_stats.listener_count,
     })
 }
 
 fn parse_runtime_from_snapshot_spec(spec_value: &Value) -> Result<GatewayRuntime, DynError> {
-    let locations = match spec_value.get("locations") {
-        Some(locations) => serde_json::from_value(locations.clone()).map_err(|err| {
-            format!(
-                "parse snapshot.spec.locations failed: {err}; check RouteSnapshot CRD schema keeps locations fields (x-kubernetes-preserve-unknown-fields)"
-            )
-        })?,
-        None => Default::default(),
-    };
-
     let listeners = match spec_value.get("listeners") {
         Some(listeners) => serde_json::from_value(listeners.clone())
             .map_err(|err| format!("parse snapshot.spec.listeners failed: {err}"))?,
@@ -172,7 +160,6 @@ fn parse_runtime_from_snapshot_spec(spec_value: &Value) -> Result<GatewayRuntime
     };
 
     Ok(GatewayRuntime {
-        locations,
         listeners,
         http_routes_v1,
         route_diagnostics,

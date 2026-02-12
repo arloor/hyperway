@@ -27,10 +27,6 @@ use crate::gateway_runtime::{
     GatewayListenerConfig, GatewayRuntime, HttpHeaderModifierV1, HttpPathMatchTypeV1, HttpPathModifierTypeV1,
     HttpRouteMatchV1, HttpRouteRuleV1, HttpStringMatchTypeV1, WeightedBackendRefV1,
 };
-use crate::location::{
-    LocationConfig, LocationSpecs, build_location_specs, build_upstream_req, find_location_configs_for_host,
-    normalize302,
-};
 use crate::metrics::METRICS;
 
 #[allow(dead_code)]
@@ -55,13 +51,12 @@ impl From<InterceptResultAdapter> for InterceptResult<AppProxyError> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct GatewayRuntimeApplyStats {
-    pub(crate) location_count: usize,
+    pub(crate) route_count: usize,
     pub(crate) listener_count: usize,
 }
 
 #[derive(Clone)]
 struct RuntimeState {
-    location_specs: LocationSpecs,
     listeners: Vec<GatewayListenerConfig>,
     http_routes_v1: Vec<HttpRouteRuleV1>,
 }
@@ -77,11 +72,9 @@ pub struct ProxyHandler {
 
 impl ProxyHandler {
     pub fn new(config: Arc<Config>) -> Result<Self, crate::DynError> {
-        let location_specs = build_location_specs(config.initial_runtime.locations.clone())?;
         let listeners = normalize_listeners(config.initial_runtime.listeners.clone());
         Ok(Self {
             runtime: Arc::new(RwLock::new(RuntimeState {
-                location_specs,
                 listeners,
                 http_routes_v1: config.initial_runtime.http_routes_v1.clone(),
             })),
@@ -93,22 +86,19 @@ impl ProxyHandler {
     pub fn replace_gateway_runtime(
         &self, runtime: GatewayRuntime,
     ) -> Result<GatewayRuntimeApplyStats, crate::DynError> {
-        let location_specs = build_location_specs(runtime.locations)?;
         let listeners = normalize_listeners(runtime.listeners);
         let route_count = runtime.http_routes_v1.len();
-        let location_count: usize = location_specs.locations.values().map(std::vec::Vec::len).sum();
         let listener_count = listeners.len();
         let mut guard = self
             .runtime
             .write()
             .map_err(|_| io::Error::other("runtime lock poisoned"))?;
         *guard = RuntimeState {
-            location_specs,
             listeners,
             http_routes_v1: runtime.http_routes_v1,
         };
         Ok(GatewayRuntimeApplyStats {
-            location_count: location_count + route_count,
+            route_count,
             listener_count,
         })
     }
@@ -119,16 +109,6 @@ impl ProxyHandler {
             .read()
             .map_err(|_| io::Error::other("runtime lock poisoned"))?;
         Ok(guard.listeners.clone())
-    }
-
-    fn normalize_redirect_response(
-        &self, original_scheme_host_port: &SchemeHostPort, resp_headers: &mut http::HeaderMap,
-    ) -> Result<(), io::Error> {
-        let guard = self
-            .runtime
-            .read()
-            .map_err(|_| io::Error::other("runtime lock poisoned"))?;
-        normalize302(original_scheme_host_port, resp_headers, &guard.location_specs.redirect_bachpaths)
     }
 
     pub async fn handle(
@@ -154,64 +134,7 @@ impl ProxyHandler {
                 .await;
         }
 
-        self.execute_legacy_route(req, client_socket_addr, &original_scheme_host_port, &req_domain.0)
-            .await
-    }
-
-    async fn execute_legacy_route(
-        &self, req: Request<Incoming>, client_socket_addr: SocketAddr, original_scheme_host_port: &SchemeHostPort,
-        request_host: &str,
-    ) -> Result<InterceptResultAdapter, io::Error> {
-        let selected = {
-            let guard = self
-                .runtime
-                .read()
-                .map_err(|_| io::Error::other("runtime lock poisoned"))?;
-            let maybe_host_configs = find_location_configs_for_host(&guard.location_specs.locations, request_host);
-            maybe_host_configs
-                .and_then(|configs| configs.iter().find(|config| config.matches_path(req.uri().path())))
-                .cloned()
-        };
-
-        let Some(LocationConfig::ReverseProxy { location, upstream, .. }) = selected else {
-            return Ok(InterceptResultAdapter::Continue(req));
-        };
-
-        METRICS.reverse_proxy_requests.inc();
-
-        let mut request = req;
-        let is_websocket = is_websocket_upgrade(&request);
-        if is_websocket {
-            debug!("[reverse] websocket {} => {}{}", client_socket_addr, original_scheme_host_port, location);
-            let client_upgrade = hyper::upgrade::on(&mut request);
-            let upstream_req = build_upstream_req(&location, &upstream, request, original_scheme_host_port)?;
-            let upstream_req = box_request_body(upstream_req);
-            let mut upstream_resp = self
-                .reverse_proxy_client
-                .request(upstream_req)
-                .await
-                .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?;
-            if upstream_resp.status() != http::StatusCode::SWITCHING_PROTOCOLS {
-                return Ok(InterceptResultAdapter::Return(map_response_body(upstream_resp)));
-            }
-            let upstream_upgrade = hyper::upgrade::on(&mut upstream_resp);
-            spawn_websocket_tunnel(client_upgrade, upstream_upgrade, "reverse");
-            return Ok(InterceptResultAdapter::Return(map_response_body(upstream_resp)));
-        }
-
-        let upstream_req = build_upstream_req(&location, &upstream, request, original_scheme_host_port)?;
-        let upstream_req = box_request_body(upstream_req);
-        let mut resp = self
-            .reverse_proxy_client
-            .request(upstream_req)
-            .await
-            .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?;
-
-        if resp.status().is_redirection() && resp.headers().contains_key(LOCATION) {
-            self.normalize_redirect_response(original_scheme_host_port, resp.headers_mut())?;
-        }
-
-        Ok(InterceptResultAdapter::Return(map_response_body(resp)))
+        Ok(InterceptResultAdapter::Continue(req))
     }
 
     async fn execute_v1_route(
@@ -341,7 +264,7 @@ impl ProxyHandler {
                         apply_header_modifier_to_response(resp.headers_mut(), modifier);
                     }
                     if resp.status().is_redirection() && resp.headers().contains_key(LOCATION) {
-                        self.normalize_redirect_response(original_scheme_host_port, resp.headers_mut())?;
+                        normalize_redirect_response(original_scheme_host_port, resp.headers_mut())?;
                     }
                     return Ok(InterceptResultAdapter::Return(map_response_body(resp)));
                 }
@@ -482,9 +405,6 @@ fn match_route_hostnames(patterns: &[String], host: &str) -> bool {
 
 fn hostname_matches(pattern: &str, host: &str) -> bool {
     if pattern == "*" {
-        return true;
-    }
-    if pattern == crate::location::DEFAULT_HOST {
         return true;
     }
     if let Some(suffix) = pattern.strip_prefix("*.") {
@@ -863,6 +783,40 @@ async fn request_with_timeout(
         .request(req)
         .await
         .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))
+}
+
+fn normalize_redirect_response(
+    original_scheme_host_port: &SchemeHostPort, resp_headers: &mut HeaderMap,
+) -> Result<(), io::Error> {
+    let Some(location_value) = resp_headers.get(LOCATION).cloned() else {
+        return Ok(());
+    };
+
+    let location = location_value
+        .to_str()
+        .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?
+        .parse::<Uri>()
+        .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?;
+    if location.scheme().is_none() {
+        return Ok(());
+    }
+
+    let Some(redirect_host) = location.host() else {
+        return Ok(());
+    };
+    if !redirect_host.ends_with(".svc.cluster.local") {
+        return Ok(());
+    }
+
+    let path_and_query = location.path_and_query().map(|value| value.as_str()).unwrap_or("/");
+    let authority = match original_scheme_host_port.port {
+        Some(port) => format!("{}:{port}", original_scheme_host_port.host),
+        None => original_scheme_host_port.host.clone(),
+    };
+    let normalized = format!("{}://{}{}", original_scheme_host_port.scheme, authority, path_and_query);
+    let normalized = HeaderValue::from_str(&normalized).map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?;
+    resp_headers.insert(LOCATION, normalized);
+    Ok(())
 }
 
 fn normalize_path(path: &str) -> String {

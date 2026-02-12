@@ -1,4 +1,4 @@
-# 完整示例：把原 location.yaml 的 argocd.arloor.com 与 dash.arloor.com 路由迁移到 Gateway API + 独立 controller(CRD 快照)模式
+# 完整示例：配置 argocd.arloor.com 与 dash.arloor.com 的 Gateway API + 独立 controller(CRD 快照)模式
 #
 # 使用方式：
 # 1) 确保集群已安装 Gateway API CRDs（gateway.networking.k8s.io）
@@ -6,7 +6,6 @@
 # 3) kubectl apply -f deploy/gateway-api-argocd-dashboard.yaml
 #
 # 注意：
-# - 原 location.yaml 里的自定义 Host header 在当前 Gateway API 解析实现中暂不支持显式配置。
 # - 本实现会把 upstream 指向 Service FQDN（*.svc.cluster.local），通常可用；若你的上游强依赖特定 Host，需要额外改造。
 ---
 apiVersion: apiextensions.k8s.io/v1
@@ -40,9 +39,6 @@ spec:
                   type: string
                 checksum:
                   type: string
-                locations:
-                  type: object
-                  x-kubernetes-preserve-unknown-fields: true
                 listeners:
                   type: array
                   items:
@@ -68,8 +64,6 @@ spec:
                   items:
                     type: object
                     x-kubernetes-preserve-unknown-fields: true
-              required:
-                - locations
             status:
               type: object
               properties:
@@ -80,10 +74,7 @@ spec:
                   type: string
                 lastAppliedChecksum:
                   type: string
-                locationHostCount:
-                  type: integer
-                  format: int64
-                locationEntryCount:
+                routeRuleCount:
                   type: integer
                   format: int64
                 listenerCount:

@@ -49,8 +49,7 @@ struct SnapshotCrdTarget {
 
 #[derive(Clone, Copy)]
 struct SnapshotStatusCounts {
-    location_host_count: u64,
-    location_entry_count: u64,
+    route_rule_count: u64,
     listener_count: u64,
 }
 
@@ -275,8 +274,8 @@ async fn sync_once(sync_target: &SyncTarget, context: &K8sApiContext) -> Result<
     context.resolve_listener_tls(&mut runtime).await?;
     let apply_stats = apply_sync_target(sync_target, context, runtime.clone()).await?;
     info!(
-        "Kubernetes Gateway API sync applied, locations={}, listeners={}, gateways={}, httproutes={}",
-        apply_stats.location_count,
+        "Kubernetes Gateway API sync applied, route_rules={}, listeners={}, gateways={}, httproutes={}",
+        apply_stats.route_count,
         apply_stats.listener_count,
         snapshot.gateways.len(),
         snapshot.http_routes.len()
@@ -298,8 +297,7 @@ async fn apply_sync_target(
                 && guard.is_some_and(|cached_hash| cached_hash == hash)
             {
                 return Ok(crate::proxy::GatewayRuntimeApplyStats {
-                    location_count: runtime.locations.values().map(std::vec::Vec::len).sum::<usize>()
-                        + runtime.http_routes_v1.len(),
+                    route_count: runtime.http_routes_v1.len(),
                     listener_count: runtime.listeners.len(),
                 });
             }
@@ -308,8 +306,7 @@ async fn apply_sync_target(
                 *guard = Some(hash);
             }
             Ok(crate::proxy::GatewayRuntimeApplyStats {
-                location_count: runtime.locations.values().map(std::vec::Vec::len).sum::<usize>()
-                    + runtime.http_routes_v1.len(),
+                route_count: runtime.http_routes_v1.len(),
                 listener_count: runtime.listeners.len(),
             })
         }
@@ -574,8 +571,7 @@ impl K8sApiContext {
         let checksum_hash = hash_gateway_runtime(runtime)?;
         let checksum = format_checksum(checksum_hash);
         let counts = SnapshotStatusCounts {
-            location_host_count: runtime.locations.len() as u64,
-            location_entry_count: runtime.locations.values().map(std::vec::Vec::len).sum::<usize>() as u64,
+            route_rule_count: runtime.http_routes_v1.len() as u64,
             listener_count: runtime.listeners.len() as u64,
         };
         let payload = json!({
@@ -589,7 +585,6 @@ impl K8sApiContext {
                 "controllerName": self.controller_name,
                 "updatedAt": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
                 "checksum": checksum,
-                "locations": &runtime.locations,
                 "listeners": &runtime.listeners,
                 "httpRoutesV1": &runtime.http_routes_v1,
                 "routeDiagnostics": &runtime.route_diagnostics,
@@ -677,8 +672,7 @@ impl K8sApiContext {
         let mut status = json!({
             "lastSyncedAt": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             "lastAppliedChecksum": checksum,
-            "locationHostCount": counts.location_host_count,
-            "locationEntryCount": counts.location_entry_count,
+            "routeRuleCount": counts.route_rule_count,
             "listenerCount": counts.listener_count,
             "conditions": [self.status_condition(
                 "Ready",
@@ -1128,20 +1122,9 @@ fn build_watch_path(path: &str) -> String {
 }
 
 fn hash_gateway_runtime(runtime: &GatewayRuntime) -> Result<u64, DynError> {
-    let mut entries = runtime
-        .locations
-        .iter()
-        .map(|(host, configs)| {
-            let mut sorted_configs = configs.clone();
-            sorted_configs.sort();
-            (host.clone(), sorted_configs)
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
     let mut listeners = runtime.listeners.clone();
     listeners.sort_by(|left, right| left.port.cmp(&right.port).then_with(|| left.name.cmp(&right.name)));
     let payload = serde_json::to_vec(&(
-        entries,
         listeners,
         &runtime.http_routes_v1,
         &runtime.route_diagnostics,

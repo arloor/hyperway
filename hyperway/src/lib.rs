@@ -8,7 +8,6 @@ mod gateway_api;
 mod gateway_api_k8s;
 mod gateway_api_snapshot_sync;
 mod gateway_runtime;
-mod location;
 mod metrics;
 mod proxy;
 
@@ -779,8 +778,8 @@ pub fn create_futures(
 mod tests {
     use super::*;
     use crate::gateway_runtime::{GatewayListenerConfig, GatewayListenerTlsConfig};
-    use std::net::{Ipv4Addr, SocketAddr};
-    use tokio::net::{TcpListener, TcpStream};
+    use std::net::{Ipv6Addr, SocketAddr};
+    use tokio::net::TcpStream;
     use tokio_rustls::TlsConnector;
     use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 
@@ -960,14 +959,18 @@ mod tests {
             Err(err) => panic!("build multi-cert tls config should succeed: {err}"),
         };
         let acceptor = TlsAcceptor::from(server_config);
-        let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await {
+        let listener = match bind_listener(0) {
             Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                return;
+            }
             Err(err) => panic!("bind test listener should succeed: {err}"),
         };
-        let addr = match listener.local_addr() {
-            Ok(addr) => addr,
+        let port = match listener.local_addr() {
+            Ok(addr) => addr.port(),
             Err(err) => panic!("read test listener addr should succeed: {err}"),
         };
+        let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
         let server_task = tokio::spawn(async move {
             for _ in 0..2 {
                 let (stream, _) = listener.accept().await?;
